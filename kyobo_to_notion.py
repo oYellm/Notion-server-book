@@ -116,33 +116,39 @@ def normalize(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
 
-# ⬇ 기존 fetch_detail / search 쪽만 교체
+# ───────── 교보 파싱: static → 실패 시 browser fallback ─────────
+import re, json, requests
+from urllib.parse import quote
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Cache-Control": "no-cache",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
 }
 
-def _clean_space(s: str | None) -> str | None:
-    if not s: return s
+def _clean(s):
+    if not s: return None
     return re.sub(r"\s+", " ", s).strip()
 
-def _jsonld_extract_all(html_text: str):
-    """JSON-LD에서 title/author/publisher/pages/genre/isbn 끌어오기 (여러 스크립트 안전 처리)"""
+def _jsonld_pick(soup_or_html: str | BeautifulSoup):
+    if isinstance(soup_or_html, BeautifulSoup):
+        scripts = soup_or_html.find_all("script", {"type":"application/ld+json"})
+        html = "".join([sc.string or "" for sc in scripts if sc.string])
+    else:
+        html = soup_or_html
     title = author = publisher = pages = genre = isbn = None
-    for m in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html_text, flags=re.S):
+    for m in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S):
         try:
             data = json.loads(m.group(1))
-            items = data if isinstance(data, list) else [data]
-            for it in items:
-                if not isinstance(it, dict): 
-                    continue
+            arr = data if isinstance(data, list) else [data]
+            for it in arr:
+                if not isinstance(it, dict): continue
                 if it.get("@type") in ("Book", "Product"):
                     title = title or it.get("name")
                     a = it.get("author")
                     if isinstance(a, list) and a:
-                        author = author or ", ".join([aa.get("name") if isinstance(aa, dict) else str(aa) for aa in a])
+                        author = author or ", ".join([aa.get("name") if isinstance(aa,dict) else str(aa) for aa in a])
                     elif isinstance(a, dict):
                         author = author or a.get("name")
                     elif isinstance(a, str):
@@ -153,16 +159,116 @@ def _jsonld_extract_all(html_text: str):
                     pages = pages or it.get("numberOfPages")
                     genre = genre or it.get("genre")
                     isbn = isbn or it.get("isbn")
-        except Exception:
-            continue
+        except:  # noqa
+            pass
     return {
-        "title": _clean_space(title),
-        "author": _clean_space(author),
-        "publisher": _clean_space(publisher),
-        "pages": int(pages) if (isinstance(pages, str) and pages.isdigit()) else pages,
-        "genre": _clean_space(genre),
-        "isbn": _clean_space(isbn),
+        "title": _clean(title),
+        "author": _clean(author),
+        "publisher": _clean(publisher),
+        "pages": int(pages) if isinstance(pages, str) and pages.isdigit() else pages,
+        "genre": _clean(genre),
+        "isbn": _clean(isbn),
     }
+
+def _og_meta(html_text: str):
+    title = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html_text)
+    img   = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html_text)
+    return {"title": _clean(title.group(1) if title else None),
+            "cover": img.group(1) if img else None}
+
+def fetch_detail_static(kyobo_id: str, light: bool=False) -> dict:
+    url = f"https://product.kyobobook.co.kr/detail/{kyobo_id}"
+    r = requests.get(url, headers=UA, timeout=20)
+    r.raise_for_status()
+    html = r.text
+    soup = BeautifulSoup(html, "html.parser")
+
+    info = {"kyobo_id": kyobo_id, "detail_url": url,
+            "title": None, "cover": None, "author": None,
+            "publisher": None, "pages": None, "genre": None, "isbn": None}
+
+    jd = _jsonld_pick(html)
+    for k,v in jd.items():
+        if v and not info.get(k): info[k] = v
+
+    og = _og_meta(html)
+    if og["title"] and not info["title"]: info["title"] = og["title"]
+    if og["cover"] and not info["cover"]: info["cover"] = og["cover"]
+
+    if not light and not info["pages"]:
+        m = re.search(r'(\d{1,5})\s*(쪽|페이지)', re.sub(r'\s+',' ', html))
+        if m: info["pages"] = int(m.group(1))
+
+    return info
+
+def fetch_detail_browser(kyobo_id: str) -> dict:
+    url = f"https://product.kyobobook.co.kr/detail/{kyobo_id}"
+    info = {"kyobo_id": kyobo_id, "detail_url": url,
+            "title": None, "cover": None, "author": None,
+            "publisher": None, "pages": None, "genre": None, "isbn": None}
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+            ctx = browser.new_context(locale="ko-KR", user_agent=UA["User-Agent"])
+            page = ctx.new_page()
+            page.goto(url, wait_until="networkidle", timeout=45000)
+
+            # 메타 바로 읽기
+            t = page.locator('meta[property="og:title"]').first.get_attribute("content")
+            i = page.locator('meta[property="og:image"]').first.get_attribute("content")
+            if t: info["title"] = _clean(t)
+            if i: info["cover"] = i
+
+            # JSON-LD 파싱
+            scripts = page.locator('script[type="application/ld+json"]').all()
+            for sc in scripts:
+                try:
+                    data = json.loads(sc.inner_text())
+                    arr = data if isinstance(data, list) else [data]
+                    for it in arr:
+                        if isinstance(it, dict) and it.get("@type") in ("Book","Product"):
+                            info["title"] = info["title"] or _clean(it.get("name"))
+                            a = it.get("author")
+                            if isinstance(a, list) and a:
+                                info["author"] = info["author"] or ", ".join([aa.get("name") if isinstance(aa,dict) else str(aa) for aa in a])
+                            elif isinstance(a, dict):
+                                info["author"] = info["author"] or a.get("name")
+                            elif isinstance(a, str):
+                                info["author"] = info["author"] or a
+                            p = it.get("publisher")
+                            if isinstance(p, dict): info["publisher"] = info["publisher"] or p.get("name")
+                            elif isinstance(p, str): info["publisher"] = info["publisher"] or p
+                            info["pages"] = info["pages"] or it.get("numberOfPages")
+                            info["genre"] = info["genre"] or it.get("genre")
+                            info["isbn"]  = info["isbn"]  or it.get("isbn")
+                except:  # noqa
+                    pass
+
+            # 텍스트 백업(페이지 수 등)
+            if not info["pages"]:
+                txt = page.content()
+                m = re.search(r'(\d{1,5})\s*(쪽|페이지)', re.sub(r'\s+',' ', txt))
+                if m: info["pages"] = int(m.group(1))
+
+            await_close = ctx.close()
+            browser.close()
+    except Exception as e:
+        print(f"[PLAYWRIGHT] fallback error: {e}")
+    return info
+
+def fetch_detail(kyobo_id: str, light: bool=False) -> dict:
+    info = fetch_detail_static(kyobo_id, light=light)
+    # static 실패 판정: 핵심 필드 전부 None/False
+    if not any([info.get("title"), info.get("author"), info.get("publisher"), info.get("cover")]):
+        print("[PARSE] static failed → headless browser fallback")
+        info2 = fetch_detail_browser(kyobo_id)
+        for k,v in info2.items():
+            if v and not info.get(k):
+                info[k] = v
+    print(f"[PARSE] kyobo={kyobo_id} title={info.get('title')} author={info.get('author')} "
+          f"publisher={info.get('publisher')} pages={info.get('pages')} cover={bool(info.get('cover'))}")
+    return info
+
 
 def _og_meta(html_text: str):
     """Open Graph/Twitter 메타 백업 추출"""
