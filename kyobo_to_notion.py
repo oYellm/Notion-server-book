@@ -119,8 +119,7 @@ def _jsonld_extract_all(html_text: str):
             for it in arr:
                 if not isinstance(it, dict): continue
                 if it.get("@type") in ("Book","Product"):
-                    title = title or it.get("name")
-                    a = it.get("author")
+                    title = title
                     if isinstance(a, list) and a:
                         author = author or ", ".join([aa.get("name") if isinstance(aa,dict) else str(aa) for aa in a])
                     elif isinstance(a, dict):
