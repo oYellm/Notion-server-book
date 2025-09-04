@@ -1,11 +1,9 @@
-import os, re, json, time, html
-import difflib
-import requests
+import os, re, json, requests, html
 from urllib.parse import quote
 from bs4 import BeautifulSoup
 from notion_client import Client
 
-# ───────────────── env & props ─────────────────
+# ============ ENV ============
 NOTION_TOKEN   = os.getenv("NOTION_TOKEN")
 DATABASE_ID    = os.getenv("DATABASE_ID")
 
@@ -17,134 +15,110 @@ GENRE_PROP     = os.getenv("GENRE_PROP", "장르")
 STATUS_PROP    = os.getenv("STATUS_PROP", "상태")
 KY_URL_PROP    = os.getenv("KY_URL_PROP", "교보 URL")
 REQUEST_PROP   = os.getenv("REQUEST_PROP", "수집요청")
+READ_PAGES_PROP= os.getenv("READ_PAGES_PROP", "읽은 페이지")
 
-GENRE_MAP_JSON = os.getenv("GENRE_MAP_JSON", "{}")
-GENRE_MAP = json.loads(GENRE_MAP_JSON)
+GENRE_MAP = json.loads(os.getenv("GENRE_MAP_JSON", "{}"))
 
-KYOBO_SEARCH_BASE = "https://search.kyobobook.co.kr/search?keyword="
-KYOBO_DETAIL_BASE = "https://product.kyobobook.co.kr/detail"
+UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8"
+}
+KYOBO_SEARCH = "https://search.kyobobook.co.kr/search?keyword="
+KYOBO_DETAIL = "https://product.kyobobook.co.kr/detail"
 
-UA = {"User-Agent": "Mozilla/5.0 (KyoboNotionBot)"}
+# ============ Notion utils ============
+if not NOTION_TOKEN or not DATABASE_ID:
+    raise SystemExit("NOTION_TOKEN / DATABASE_ID 누락")
 
-# ───────────────── helpers ─────────────────
-def notion() -> Client:
-    if not NOTION_TOKEN or not DATABASE_ID:
-        raise SystemExit("NOTION_TOKEN / DATABASE_ID 누락")
-    return Client(auth=NOTION_TOKEN)
+nc = Client(auth=NOTION_TOKEN)
 
-def extract_kyobo_id(s: str) -> str | None:
-    m = re.search(r"(S\d{6,})", s)
-    return m.group(1) if m else None
+def page_prop_type(props: dict, name: str) -> str|None:
+    p = props.get(name); return p.get("type") if p else None
 
-def get_db_schema(nc: Client):
-    return nc.databases.retrieve(DATABASE_ID)
+def build_value(ptype: str, v):
+    if v is None: return None
+    if ptype == "title":     return {"title":     [{"text":{"content":str(v)}}]}
+    if ptype == "rich_text": return {"rich_text": [{"text":{"content":str(v)}}]}
+    if ptype == "url":       return {"url": str(v)}
+    if ptype == "number":
+        try: return {"number": int(v)}
+        except: return None
+    if ptype == "select":    return {"select": {"name": str(v)}}
+    if ptype == "multi_select":
+        items = [s.strip() for s in str(v).split(",") if s.strip()]
+        return {"multi_select": [{"name": s} for s in items]}
+    if ptype == "checkbox":  return {"checkbox": bool(v)}
+    return None
 
-def ensure_status_option(nc: Client, db_schema: dict, option_name: str = "시작 전"):
-    prop = db_schema["properties"].get(STATUS_PROP)
-    if not prop or prop.get("type") != "select":
-        return
+def ensure_status_option(option="시작 전"):
+    db = nc.databases.retrieve(DATABASE_ID)
+    prop = db["properties"].get(STATUS_PROP)
+    if not prop or prop.get("type") != "select": return
     names = [o["name"] for o in prop["select"]["options"]]
-    if option_name in names:
-        return
-    # add option
-    prop["select"]["options"].append({"name": option_name, "color": "default"})
+    if option in names: return
+    prop["select"]["options"].append({"name": option, "color": "default"})
     nc.databases.update(
         database_id=DATABASE_ID,
         properties={STATUS_PROP: {"select": {"options": prop["select"]["options"]}}}
     )
 
-def page_title_of(nc: Client, page: dict) -> str:
-    for k, v in page["properties"].items():
+def query_pending_pages():
+    results, cursor = [], None
+    while True:
+        resp = nc.databases.query(
+            database_id=DATABASE_ID,
+            filter={"property": REQUEST_PROP, "checkbox": {"equals": True}},
+            start_cursor=cursor
+        )
+        results += resp["results"]
+        if not resp.get("has_more"): break
+        cursor = resp.get("next_cursor")
+    return results
+
+def page_title(props: dict) -> str:
+    for k, v in props.items():
         if v.get("type") == "title":
-            return "".join([t["plain_text"] for t in v["title"]]).strip()
+            return "".join(t["plain_text"] for t in v["title"]).strip()
     return ""
 
-def page_prop_type(page_or_schema_props: dict, name: str) -> str | None:
-    p = page_or_schema_props.get(name)
-    return p.get("type") if p else None
+# ============ Kyobo search ============
+def extract_id(s: str) -> str|None:
+    m = re.search(r"(S\d{6,})", s or ""); return m.group(1) if m else None
 
-def build_value(ptype: str, value):
-    if value is None: return None
-    if ptype == "title":
-        return {"title": [{"text": {"content": str(value)}}]}
-    if ptype == "rich_text":
-        return {"rich_text": [{"text": {"content": str(value)}}]}
-    if ptype == "url":
-        return {"url": str(value)}
-    if ptype == "number":
-        try: return {"number": int(value)}
-        except: return None
-    if ptype == "select":
-        return {"select": {"name": str(value)}}
-    if ptype == "multi_select":
-        parts = [s.strip() for s in str(value).split(",") if s.strip()]
-        return {"multi_select": [{"name": s} for s in parts]}
-    if ptype == "checkbox":
-        return {"checkbox": bool(value)}
-    return None
+def search_candidates_by_title(title: str) -> list[str]:
+    html = requests.get(KYOBO_SEARCH + quote(title), headers=UA, timeout=20).text
+    ids = list(dict.fromkeys(re.findall(r"/detail/(S\d{6,})", html)))
+    if ids: return ids
+    # 모바일 백업
+    mhtml = requests.get("https://m.kyobobook.co.kr/search?keyword=" + quote(title), headers=UA, timeout=20).text
+    return list(dict.fromkeys(re.findall(r"/detail/(S\d{6,})", mhtml)))
 
-# ───────────────── Kyobo scraping ─────────────────
-def search_candidates_by_title(title: str) -> list[dict]:
-    """교보 검색에서 상위 후보 여러 개 추출"""
-    url = KYOBO_SEARCH_BASE + quote(title)
-    html_text = requests.get(url, headers=UA, timeout=15).text
-    # 후보: /detail/Sxxxx 링크들
-    ids = list(dict.fromkeys(re.findall(r"/detail/(S\d{6,})", html_text)))
-    cands = []
-    for kid in ids[:10]:
-        # 제목/저자/출판사 힌트를 검색 HTML에서 유추(없어도 OK)
-        cands.append({"kyobo_id": kid})
-    return cands
-
-def choose_best_candidate(title: str, cands: list[dict]) -> str | None:
-    """제목 유사도 기반으로 최적 후보 선택 (간단 점수)"""
-    if not cands: return None
-    # 디코딩/정리
-    key = normalize(title)
-    best_id, best_score = None, -1.0
-    for c in cands:
-        # 상세 한번 열어 정확한 제목을 본 뒤 유사도 채점 (정확도↑)
-        info = fetch_detail(c["kyobo_id"], light=True)
-        cand_title = info.get("title") or ""
-        score = difflib.SequenceMatcher(a=key, b=normalize(cand_title)).ratio()
+def choose_best_id(title: str, ids: list[str]) -> str|None:
+    if not ids: return None
+    key = _norm(title)
+    best = None; best_score = -1
+    for kid in ids[:5]:
+        brief = fetch_detail(kid, light=True)
+        cand = _norm(brief.get("title") or "")
+        score = _sim(key, cand)
         if score > best_score:
-            best_score, best_id = score, c["kyobo_id"]
-    return best_id
+            best, best_score = kid, score
+    return best
 
-def normalize(s: str) -> str:
-    s = html.unescape(s or "")
-    s = re.sub(r"\s+", " ", s).strip().lower()
-    return s
-
-# ───────── 교보 파싱: static → 실패 시 browser fallback ─────────
-import re, json, requests
-from urllib.parse import quote
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
-
-UA = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
-}
-
-def _clean(s):
+# ============ Kyobo detail parsing ============
+def _clean(s): 
     if not s: return None
     return re.sub(r"\s+", " ", s).strip()
 
-def _jsonld_pick(soup_or_html: str | BeautifulSoup):
-    if isinstance(soup_or_html, BeautifulSoup):
-        scripts = soup_or_html.find_all("script", {"type":"application/ld+json"})
-        html = "".join([sc.string or "" for sc in scripts if sc.string])
-    else:
-        html = soup_or_html
+def _jsonld_extract_all(html_text: str):
     title = author = publisher = pages = genre = isbn = None
-    for m in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S):
+    for m in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html_text, re.S):
         try:
             data = json.loads(m.group(1))
             arr = data if isinstance(data, list) else [data]
             for it in arr:
                 if not isinstance(it, dict): continue
-                if it.get("@type") in ("Book", "Product"):
+                if it.get("@type") in ("Book","Product"):
                     title = title or it.get("name")
                     a = it.get("author")
                     if isinstance(a, list) and a:
@@ -158,7 +132,7 @@ def _jsonld_pick(soup_or_html: str | BeautifulSoup):
                     elif isinstance(p, str): publisher = publisher or p
                     pages = pages or it.get("numberOfPages")
                     genre = genre or it.get("genre")
-                    isbn = isbn or it.get("isbn")
+                    isbn  = isbn  or it.get("isbn")
         except:  # noqa
             pass
     return {
@@ -171,38 +145,35 @@ def _jsonld_pick(soup_or_html: str | BeautifulSoup):
     }
 
 def _og_meta(html_text: str):
-    title = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html_text)
-    img   = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html_text)
-    return {"title": _clean(title.group(1) if title else None),
-            "cover": img.group(1) if img else None}
+    t = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html_text)
+    i = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html_text)
+    return {"title": _clean(t.group(1) if t else None), "cover": i.group(1) if i else None}
 
-def fetch_detail_static(kyobo_id: str, light: bool=False) -> dict:
-    url = f"https://product.kyobobook.co.kr/detail/{kyobo_id}"
-    r = requests.get(url, headers=UA, timeout=20)
-    r.raise_for_status()
-    html = r.text
-    soup = BeautifulSoup(html, "html.parser")
-
+def fetch_detail_static(kyobo_id: str, light=False) -> dict:
+    url = f"{KYOBO_DETAIL}/{kyobo_id}"
+    r = requests.get(url, headers=UA, timeout=25); r.raise_for_status()
+    html_txt = r.text
     info = {"kyobo_id": kyobo_id, "detail_url": url,
             "title": None, "cover": None, "author": None,
             "publisher": None, "pages": None, "genre": None, "isbn": None}
 
-    jd = _jsonld_pick(html)
+    jd = _jsonld_extract_all(html_txt)
     for k,v in jd.items():
         if v and not info.get(k): info[k] = v
 
-    og = _og_meta(html)
+    og = _og_meta(html_txt)
     if og["title"] and not info["title"]: info["title"] = og["title"]
     if og["cover"] and not info["cover"]: info["cover"] = og["cover"]
 
     if not light and not info["pages"]:
-        m = re.search(r'(\d{1,5})\s*(쪽|페이지)', re.sub(r'\s+',' ', html))
+        m = re.search(r'(\d{1,5})\s*(쪽|페이지)', re.sub(r'\s+',' ', html_txt))
         if m: info["pages"] = int(m.group(1))
-
     return info
 
 def fetch_detail_browser(kyobo_id: str) -> dict:
-    url = f"https://product.kyobobook.co.kr/detail/{kyobo_id}"
+    # import를 함수 안에서 해 Playwright 미설치 환경 대비
+    from playwright.sync_api import sync_playwright
+    url = f"{KYOBO_DETAIL}/{kyobo_id}"
     info = {"kyobo_id": kyobo_id, "detail_url": url,
             "title": None, "cover": None, "author": None,
             "publisher": None, "pages": None, "genre": None, "isbn": None}
@@ -213,13 +184,11 @@ def fetch_detail_browser(kyobo_id: str) -> dict:
             page = ctx.new_page()
             page.goto(url, wait_until="networkidle", timeout=45000)
 
-            # 메타 바로 읽기
             t = page.locator('meta[property="og:title"]').first.get_attribute("content")
             i = page.locator('meta[property="og:image"]').first.get_attribute("content")
             if t: info["title"] = _clean(t)
             if i: info["cover"] = i
 
-            # JSON-LD 파싱
             scripts = page.locator('script[type="application/ld+json"]').all()
             for sc in scripts:
                 try:
@@ -235,193 +204,91 @@ def fetch_detail_browser(kyobo_id: str) -> dict:
                                 info["author"] = info["author"] or a.get("name")
                             elif isinstance(a, str):
                                 info["author"] = info["author"] or a
-                            p = it.get("publisher")
-                            if isinstance(p, dict): info["publisher"] = info["publisher"] or p.get("name")
-                            elif isinstance(p, str): info["publisher"] = info["publisher"] or p
+                            pbl = it.get("publisher")
+                            if isinstance(pbl, dict): info["publisher"] = info["publisher"] or pbl.get("name")
+                            elif isinstance(pbl, str): info["publisher"] = info["publisher"] or pbl
                             info["pages"] = info["pages"] or it.get("numberOfPages")
                             info["genre"] = info["genre"] or it.get("genre")
                             info["isbn"]  = info["isbn"]  or it.get("isbn")
                 except:  # noqa
                     pass
 
-            # 텍스트 백업(페이지 수 등)
             if not info["pages"]:
                 txt = page.content()
                 m = re.search(r'(\d{1,5})\s*(쪽|페이지)', re.sub(r'\s+',' ', txt))
                 if m: info["pages"] = int(m.group(1))
-
-            await_close = ctx.close()
-            browser.close()
+            ctx.close(); browser.close()
     except Exception as e:
         print(f"[PLAYWRIGHT] fallback error: {e}")
     return info
 
-def fetch_detail(kyobo_id: str, light: bool=False) -> dict:
+def fetch_detail(kyobo_id: str, light=False) -> dict:
     info = fetch_detail_static(kyobo_id, light=light)
-    # static 실패 판정: 핵심 필드 전부 None/False
     if not any([info.get("title"), info.get("author"), info.get("publisher"), info.get("cover")]):
-        print("[PARSE] static failed → headless browser fallback")
+        print("[PARSE] static failed → headless fallback")
         info2 = fetch_detail_browser(kyobo_id)
         for k,v in info2.items():
-            if v and not info.get(k):
-                info[k] = v
+            if v and not info.get(k): info[k] = v
     print(f"[PARSE] kyobo={kyobo_id} title={info.get('title')} author={info.get('author')} "
           f"publisher={info.get('publisher')} pages={info.get('pages')} cover={bool(info.get('cover'))}")
     return info
 
+# ============ genre map / similarity ============
+def _norm(s): return re.sub(r"\s+"," ", (s or "").lower()).strip()
+def _sim(a,b):
+    A = {a[i:i+2] for i in range(max(len(a)-1,1))}
+    B = {b[i:i+2] for i in range(max(len(b)-1,1))}
+    inter = len(A & B)
+    return inter/len(A) if A else 0
 
-def _og_meta(html_text: str):
-    """Open Graph/Twitter 메타 백업 추출"""
-    og_title = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html_text)
-    tw_title = re.search(r'<meta[^>]+name="twitter:title"[^>]+content="([^"]+)"', html_text)
-    og_img   = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html_text)
-    return {
-        "title": _clean_space((og_title or tw_title).group(1)) if (og_title or tw_title) else None,
-        "cover": (og_img.group(1) if og_img else None)
-    }
-
-def _loose_text_fallback(compact_text: str):
-    """라벨 텍스트에서 대충 뽑아내는 최후의 백업"""
-    # 페이지수
-    pages = None
-    m = re.search(r'(\d{1,5})\s*(쪽|페이지)', compact_text)
-    if m: pages = int(m.group(1))
-    # 출판사/저자 근사치
-    pub = None
-    m = re.search(r'출판사[^\S\r\n]*[:\-]?\s*([가-힣A-Za-z0-9&\.\s]{2,40})', compact_text)
-    if m: pub = _clean_space(m.group(1))
-    aut = None
-    m = re.search(r'저자[^\S\r\n]*[:\-]?\s*([가-힣A-Za-z0-9&\.\,\s]{2,60})', compact_text)
-    if m: aut = _clean_space(m.group(1))
-    return {"author": aut, "publisher": pub, "pages": pages}
-
-def fetch_detail(kyobo_id: str, light: bool=False) -> dict:
-    """교보 상세에서 메타 수집 (강인해진 버전)"""
-    url_pc = f"https://product.kyobobook.co.kr/detail/{kyobo_id}"
-    # 1) PC 페이지 시도
-    r = requests.get(url_pc, headers=UA, timeout=20)
-    r.raise_for_status()
-    html_pc = r.text
-    compact = re.sub(r"\s+", " ", html_pc)
-
-    info = {"kyobo_id": kyobo_id, "detail_url": url_pc, "title": None, "cover": None,
-            "author": None, "publisher": None, "pages": None, "genre": None, "isbn": None}
-
-    # 1-a) JSON-LD
-    jd = _jsonld_extract_all(html_pc)
-    for k,v in jd.items():
-        if v and info.get(k) in (None, "", 0): info[k] = v
-
-    # 1-b) OG/Twitter 메타
-    og = _og_meta(html_pc)
-    if og.get("title") and not info["title"]: info["title"] = og["title"]
-    if og.get("cover") and not info["cover"]: info["cover"] = og["cover"]
-
-    # 1-c) 최후 텍스트 백업
-    if not light:
-        loose = _loose_text_fallback(compact)
-        for k,v in loose.items():
-            if v and not info.get(k): info[k] = v
-
-    # 2) 핵심이 여전히 비었으면 모바일 검색 백업(HTML 구조가 더 단순)
-    missing_core = not info["title"] or not info["cover"]
-    if missing_core and not light:
-        url_m = f"https://m.kyobobook.co.kr/search?keyword={quote(info['title'] or kyobo_id)}"
-        try:
-            hm = requests.get(url_m, headers=UA, timeout=15).text
-            # 모바일 검색에서 첫 detail id 뽑기
-            m_ids = list(dict.fromkeys(re.findall(r"/detail/(S\d{6,})", hm)))
-            if m_ids:
-                url_m_detail = f"https://product.kyobobook.co.kr/detail/{m_ids[0]}"
-                hm2 = requests.get(url_m_detail, headers=UA, timeout=15).text
-                og2 = _og_meta(hm2)
-                if og2.get("title") and not info["title"]: info["title"] = og2["title"]
-                if og2.get("cover") and not info["cover"]: info["cover"] = og2["cover"]
-        except Exception:
-            pass
-
-    # 숫자 변환
-    if isinstance(info["pages"], str) and info["pages"].isdigit():
-        info["pages"] = int(info["pages"])
-
-    # 디버그(필요 시 주석 해제해 로그에서 확인)
-    print(f"[PARSE] kyobo={kyobo_id} title={info['title']!r} author={info['author']!r} "
-          f"publisher={info['publisher']!r} pages={info['pages']!r} cover={bool(info['cover'])}")
-
-    return info
-
-# ───────────────── Genre mapping ─────────────────
-def map_genre(raw: str | None) -> str | None:
+def map_genre(raw: str|None) -> str|None:
     if not raw: return None
-    r = normalize(raw)
-    for keys, notion_value in GENRE_MAP.items():
+    R = _norm(raw)
+    for keys, val in GENRE_MAP.items():
         for k in keys.split(","):
-            k = k.strip().lower()
-            if not k: continue
-            if k in r:
-                return notion_value
+            if k.strip() and k.strip().lower() in R:
+                return val
     return None
 
-# ───────────────── Notion processing ─────────────────
-def query_pending_pages(nc: Client) -> list[dict]:
-    """수집요청=TRUE 인 페이지들 가져오기"""
-    results = []
-    cursor = None
-    while True:
-        resp = nc.databases.query(
-            database_id=DATABASE_ID,
-            filter={"property": REQUEST_PROP, "checkbox": {"equals": True}},
-            start_cursor=cursor
-        )
-        results.extend(resp["results"])
-        cursor = resp.get("next_cursor")
-        if not resp.get("has_more"): break
-    return results
-
-def update_page(nc: Client, page_id: str, info: dict, db_schema: dict):
-    """커버 + 속성 업데이트, 상태=시작 전, 수집요청=false, 읽은 페이지=0(있으면)"""
+# ============ updater ============
+def update_page(page_id: str, info: dict):
     # 커버
     if info.get("cover"):
-        nc.pages.update(page_id=page_id, cover={"external": {"url": info["cover"]}})
+        nc.pages.update(page_id=page_id, cover={"external":{"url": info["cover"]}})
 
     props_now = nc.pages.retrieve(page_id=page_id)["properties"]
     patch = {}
 
-    # 제목
-    tprop = next((k for k,v in props_now.items() if v.get("type")=="title"), None)
-    if tprop and info.get("title"):
-        patch[tprop] = build_value("title", info["title"])
+    # 제목(실제 제목 속성명 찾기)
+    title_prop = next((k for k,v in props_now.items() if v.get("type")=="title"), None)
+    if title_prop and info.get("title"):
+        patch[title_prop] = build_value("title", info["title"])
 
-    # 필드들
-    for key, prop_name in [
-        ("author",    AUTHOR_PROP),
-        ("publisher", PUBLISHER_PROP),
-        ("pages",     PAGES_PROP),
-        ("ky_url",    KY_URL_PROP),
-    ]:
-        value = info.get("author") if key=="author" else \
-                info.get("publisher") if key=="publisher" else \
-                info.get("pages") if key=="pages" else \
-                info.get("detail_url") if key=="ky_url" else None
+    # 저자/출판사/페이지/URL
+    for key, name in [("author",AUTHOR_PROP), ("publisher",PUBLISHER_PROP),
+                      ("pages",PAGES_PROP), ("url",KY_URL_PROP)]:
+        val = info.get("author") if key=="author" else \
+              info.get("publisher") if key=="publisher" else \
+              info.get("pages") if key=="pages" else \
+              info.get("detail_url") if key=="url" else None
+        ptype = page_prop_type(props_now, name)
+        if ptype and val is not None:
+            pv = build_value(ptype, val)
+            if pv: patch[name] = pv
 
-        ptype = page_prop_type(props_now, prop_name)
-        if ptype and value is not None:
-            pv = build_value(ptype, value)
-            if pv: patch[prop_name] = pv
-
-    # 장르 매핑
-    mapped = map_genre(info.get("genre")) or map_genre(info.get("title")) or None
-    if mapped and page_prop_type(props_now, GENRE_PROP) in ("select","multi_select"):
-        pv = build_value(page_prop_type(props_now, GENRE_PROP), mapped)
-        if pv: patch[GENRE_PROP] = pv
+    # 장르
+    gtype = page_prop_type(props_now, GENRE_PROP)
+    mapped = map_genre(info.get("genre") or info.get("title"))
+    if mapped and gtype in ("select","multi_select"):
+        patch[GENRE_PROP] = build_value(gtype, mapped)
 
     # 상태 = 시작 전
     if page_prop_type(props_now, STATUS_PROP) == "select":
-        patch[STATUS_PROP] = {"select": {"name": "시작 전"}}
+        patch[STATUS_PROP] = {"select":{"name":"시작 전"}}
 
     # 읽은 페이지 = 0 (있으면)
-    if page_prop_type(props_now, "읽은 페이지") == "number":
-        patch["읽은 페이지"] = {"number": 0}
+    if page_prop_type(props_now, READ_PAGES_PROP) == "number":
+        patch[READ_PAGES_PROP] = {"number": 0}
 
     # 수집요청 해제
     if page_prop_type(props_now, REQUEST_PROP) == "checkbox":
@@ -430,35 +297,35 @@ def update_page(nc: Client, page_id: str, info: dict, db_schema: dict):
     if patch:
         nc.pages.update(page_id=page_id, properties=patch)
 
+# ============ main ============
 def run_once():
-    nc = notion()
-    db_schema = get_db_schema(nc)
-    ensure_status_option(nc, db_schema, "시작 전")
-
-    pages = query_pending_pages(nc)
+    ensure_status_option("시작 전")
+    pages = query_pending_pages()
     if not pages:
         print("[INFO] pending 없음"); return
 
     for pg in pages:
         page_id = pg["id"]
-        title = page_title_of(nc, pg)
-        ky_url_prop = pg["properties"].get(KY_URL_PROP)
+        props = pg["properties"]
+        title = page_title(props)
         kyobo_id = None
-        if ky_url_prop and ky_url_prop.get("type")=="url" and ky_url_prop.get("url"):
-            kyobo_id = extract_kyobo_id(ky_url_prop["url"])
 
-        # 후보 결정
+        # 1) 교보 URL에 ID가 있으면 우선
+        if KY_URL_PROP in props and props[KY_URL_PROP].get("type")=="url":
+            url = props[KY_URL_PROP].get("url")
+            kyobo_id = extract_id(url) if url else None
+
+        # 2) 없으면 제목으로 검색→최적 선택
         if not kyobo_id:
-            cands = search_candidates_by_title(title)
-            kyobo_id = choose_best_candidate(title, cands)
+            ids = search_candidates_by_title(title)
+            kyobo_id = choose_best_id(title, ids)
 
         if not kyobo_id:
-            print(f"[WARN] 교보 ID 미결정: {title}")
+            print(f"[WARN] 교보 ID 선택 실패: {title}")
             continue
 
         info = fetch_detail(kyobo_id, light=False)
-        # 노션에 업데이트
-        update_page(nc, page_id, info, db_schema)
+        update_page(page_id, info)
         print(f"[OK] {title} <- {info.get('title')} ({kyobo_id})")
 
 if __name__ == "__main__":
