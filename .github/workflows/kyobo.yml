@@ -2,27 +2,33 @@ name: Kyobo → Notion (auto fill)
 
 on:
   schedule:
-    - cron: "*/1 * * * *"   # 1분마다 실행
-  workflow_dispatch: {}     # 수동 실행 버튼
+    - cron: "*/1 * * * *"   # 1분마다 (UTC 기준)
+  workflow_dispatch: {}      # 수동 실행 버튼
+
+concurrency:
+  group: kyobo-notion
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       DATABASE_ID:  ${{ secrets.DATABASE_ID }}
 
-      # 네 DB 속성명이 다르면 여기서 바꿔
-      TITLE_PROP:   책 제목
-      AUTHOR_PROP:  저자
-      PUBLISHER_PROP: 출판사
-      PAGES_PROP:   페이지
-      GENRE_PROP:   장르
-      STATUS_PROP:  상태
-      KY_URL_PROP:  교보 URL
-      REQUEST_PROP: 수집요청
+      # ── 노션 속성명 (네 DB와 다르면 수정) ──
+      TITLE_PROP:       책 제목
+      AUTHOR_PROP:      저자
+      PUBLISHER_PROP:   출판사
+      PAGES_PROP:       페이지
+      GENRE_PROP:       장르
+      STATUS_PROP:      상태
+      KY_URL_PROP:      교보 URL
+      REQUEST_PROP:     수집요청
+      READ_PAGES_PROP:  읽은 페이지
 
-      # 장르 매핑(원하면 수정)
+      # ── 장르 매핑 테이블 ──
       GENRE_MAP_JSON: >
         {
           "과학,자연,물리,화학,생물,천문": "과학",
@@ -38,26 +44,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Run
+
+      - name: Install Playwright (Chromium)
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Run scraper → Notion updater
         run: |
           python kyobo_to_notion.py
-      - name: Debug one row (optional)
-        run: |
-          python - <<'PY'
-          import os, re, requests, json
-          UA = {"User-Agent":"Mozilla/5.0","Accept-Language":"ko-KR,ko;q=0.9"}
-          url = "https://product.kyobobook.co.kr/detail/S000001410075"  # 네 '교보 URL' 중 하나로 교체해도 됨
-          html = requests.get(url, headers=UA, timeout=20).text
-          print("html length:", len(html))
-          import re
-          m = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html)
-          print("og:title:", m.group(1) if m else None)
-          n = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html)
-          print("og:image:", bool(n))
-          PY
