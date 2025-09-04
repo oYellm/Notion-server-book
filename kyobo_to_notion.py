@@ -1,4 +1,38 @@
 import os, re, json, requests, html
+# ── 제목 정제 + 본문 추출 ─────────────────────────────
+def clean_book_title(t: str | None) -> str | None:
+    if not t:
+        return t
+    t = re.sub(r"\s+", " ", t).strip()
+    # ' | ' 뒤 부제/저자/사이트 꼬리표 제거
+    if " | " in t:
+        t = t.split(" | ", 1)[0].strip()
+    # '- 교보문고' 류 제거
+    t = re.sub(r"\s*[-–—]\s*(교보문고|Kyobo\s*Book\s*Centre)\s*$", "", t, flags=re.I)
+    return t
+
+def extract_title_from_body_html(html_text: str) -> str | None:
+    """교보 상세 본문에서 제목을 직접 추출(선호 순서대로 시도)"""
+    soup = BeautifulSoup(html_text, "html.parser")
+    selectors = [
+        "h1.prod_title",                    # 신사이트
+        ".prod_detail_header h1",           # 변형 1
+        ".bookDetail_header__title",        # React 컴포넌트 케이스
+        "h1.tit",                           # 구사이트
+        ".prod_title strong", ".prod_title em",
+        ".product_detail .title",           # 기타
+        "h1"
+    ]
+    for sel in selectors:
+        node = soup.select_one(sel)
+        if node:
+            cand = node.get_text(strip=True)
+            cand = clean_book_title(cand)
+            # 과도하게 긴 문자열/사이트명 포함은 버림
+            if cand and len(cand) <= 100 and "교보문고" not in cand:
+                return cand
+    return None
+
 from urllib.parse import quote
 from bs4 import BeautifulSoup
 from notion_client import Client
@@ -156,21 +190,30 @@ def fetch_detail_static(kyobo_id: str, light=False) -> dict:
             "title": None, "cover": None, "author": None,
             "publisher": None, "pages": None, "genre": None, "isbn": None}
 
+    # 1) JSON-LD 최우선
     jd = _jsonld_extract_all(html_txt)
     for k,v in jd.items():
         if v and not info.get(k): info[k] = v
 
+    # 2) 본문에서 제목 직접 추출 (OG/title보다 우선)
+    body_title = extract_title_from_body_html(html_txt)
+    if body_title:
+        info["title"] = body_title
+
+    # 3) 커버만 OG에서 보완 (제목은 쓰지 않음)
     og = _og_meta(html_txt)
-    if og["title"] and not info["title"]: info["title"] = og["title"]
     if og["cover"] and not info["cover"]: info["cover"] = og["cover"]
 
     if not light and not info["pages"]:
         m = re.search(r'(\d{1,5})\s*(쪽|페이지)', re.sub(r'\s+',' ', html_txt))
         if m: info["pages"] = int(m.group(1))
+
+    if info["title"]:
+        info["title"] = clean_book_title(info["title"])
     return info
 
+
 def fetch_detail_browser(kyobo_id: str) -> dict:
-    # import를 함수 안에서 해 Playwright 미설치 환경 대비
     from playwright.sync_api import sync_playwright
     url = f"{KYOBO_DETAIL}/{kyobo_id}"
     info = {"kyobo_id": kyobo_id, "detail_url": url,
@@ -183,11 +226,7 @@ def fetch_detail_browser(kyobo_id: str) -> dict:
             page = ctx.new_page()
             page.goto(url, wait_until="networkidle", timeout=45000)
 
-            t = page.locator('meta[property="og:title"]').first.get_attribute("content")
-            i = page.locator('meta[property="og:image"]').first.get_attribute("content")
-            if t: info["title"] = _clean(t)
-            if i: info["cover"] = i
-
+            # 1) JSON-LD
             scripts = page.locator('script[type="application/ld+json"]').all()
             for sc in scripts:
                 try:
@@ -195,7 +234,7 @@ def fetch_detail_browser(kyobo_id: str) -> dict:
                     arr = data if isinstance(data, list) else [data]
                     for it in arr:
                         if isinstance(it, dict) and it.get("@type") in ("Book","Product"):
-                            info["title"] = info["title"] or _clean(it.get("name"))
+                            info["title"] = info["title"] or clean_book_title(it.get("name"))
                             a = it.get("author")
                             if isinstance(a, list) and a:
                                 info["author"] = info["author"] or ", ".join([aa.get("name") if isinstance(aa,dict) else str(aa) for aa in a])
@@ -209,17 +248,41 @@ def fetch_detail_browser(kyobo_id: str) -> dict:
                             info["pages"] = info["pages"] or it.get("numberOfPages")
                             info["genre"] = info["genre"] or it.get("genre")
                             info["isbn"]  = info["isbn"]  or it.get("isbn")
-                except:  # noqa
+                except:
                     pass
+
+            # 2) 본문에서 제목 직접 추출 (JSON-LD 없을 때/보완)
+            if not info["title"]:
+                selectors = [
+                    "h1.prod_title", ".prod_detail_header h1",
+                    ".bookDetail_header__title", "h1.tit", ".prod_title strong", "h1"
+                ]
+                for sel in selectors:
+                    if page.locator(sel).count() > 0:
+                        t = page.locator(sel).first.inner_text().strip()
+                        t = clean_book_title(t)
+                        if t and "교보문고" not in t and len(t) <= 100:
+                            info["title"] = t
+                            break
+
+            # 3) 커버만 OG에서 보완
+            i = page.locator('meta[property="og:image"]').first.get_attribute("content")
+            if i and not info["cover"]:
+                info["cover"] = i
 
             if not info["pages"]:
                 txt = page.content()
                 m = re.search(r'(\d{1,5})\s*(쪽|페이지)', re.sub(r'\s+',' ', txt))
                 if m: info["pages"] = int(m.group(1))
+
             ctx.close(); browser.close()
     except Exception as e:
         print(f"[PLAYWRIGHT] fallback error: {e}")
+
+    if info["title"]:
+        info["title"] = clean_book_title(info["title"])
     return info
+
 
 def fetch_detail(kyobo_id: str, light=False) -> dict:
     info = fetch_detail_static(kyobo_id, light=light)
@@ -285,9 +348,7 @@ def update_page(page_id: str, info: dict):
     if page_prop_type(props_now, STATUS_PROP) == "select":
         patch[STATUS_PROP] = {"select":{"name":"시작 전"}}
 
-    # 읽은 페이지 = 0 (있으면)
-    if page_prop_type(props_now, READ_PAGES_PROP) == "number":
-        patch[READ_PAGES_PROP] = {"number": 0}
+    
 
     # 수집요청 해제
     if page_prop_type(props_now, REQUEST_PROP) == "checkbox":
