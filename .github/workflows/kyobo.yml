@@ -1,0 +1,50 @@
+name: Kyobo → Notion (fetch & fill)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # 예시: 5분마다 실행 (UTC 기준)
+  workflow_dispatch: {}     # 필요 시 수동 실행
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      DATABASE_ID:  ${{ secrets.DATABASE_ID }}
+
+      # DB 속성명(네 DB와 다르면 바꿔도 됨 — vars로 빼도 됨)
+      TITLE_PROP:   책 제목
+      AUTHOR_PROP:  저자
+      PUBLISHER_PROP: 출판사
+      PAGES_PROP:   페이지
+      GENRE_PROP:   장르
+      STATUS_PROP:  상태
+      KY_URL_PROP:  교보 URL
+      REQUEST_PROP: 수집요청
+
+      # 장르 매핑 테이블(간단 키워드 → 노션 select 값). 쉼표로 여러 키워드.
+      GENRE_MAP_JSON: >
+        {
+          "과학,자연,물리,화학,생물,천문": "과학",
+          "수학,미적분,통계": "수학",
+          "컴퓨터,IT,프로그래밍,코딩,인공지능,데이터": "IT",
+          "소설,장편,단편,문학": "소설",
+          "에세이,수필": "에세이",
+          "인문,철학,심리": "인문",
+          "역사,세계사,한국사": "역사",
+          "경제,경영,마케팅,회계,재테크": "경영/경제",
+          "자기계발,자기개발,동기": "자기계발",
+          "기타,essay": "기타"
+        }
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run
+        run: |
+          python kyobo_to_notion.py
