@@ -47,3 +47,17 @@ jobs:
       - name: Run
         run: |
           python kyobo_to_notion.py
+      - name: Debug one row (optional)
+        run: |
+          python - <<'PY'
+          import os, re, requests, json
+          UA = {"User-Agent":"Mozilla/5.0","Accept-Language":"ko-KR,ko;q=0.9"}
+          url = "https://product.kyobobook.co.kr/detail/S000001410075"  # 네 '교보 URL' 중 하나로 교체해도 됨
+          html = requests.get(url, headers=UA, timeout=20).text
+          print("html length:", len(html))
+          import re
+          m = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', html)
+          print("og:title:", m.group(1) if m else None)
+          n = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html)
+          print("og:image:", bool(n))
+          PY
