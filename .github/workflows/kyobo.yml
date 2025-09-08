@@ -50,20 +50,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      -  name: Install dependencies
+   - name: Install dependencies
   shell: bash
   run: |
     python -m pip install --upgrade pip
     pip install -r requirements.txt
     python -m playwright install --with-deps chromium
-import importlib, sys, subprocess
-pkgs = ['playwright']
-for p in pkgs:
-    try:
-        importlib.import_module(p)
-    except Exception:
-        subprocess.check_call([sys.executable, '-m', 'pip', 'install', p])
-PY
+
 
       - name: Install Playwright (Chromium)
         run: |
