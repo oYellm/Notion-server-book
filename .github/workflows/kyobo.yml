@@ -1,8 +1,8 @@
-name: Kyobo → Notion (auto fill)
+name: Kyobo → Notion (every 5 min)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # GitHub 최소 간격: 5분
+    - cron: "*/5 * * * *"   # GitHub Actions practical minimum interval
   workflow_dispatch: {}
 
 permissions:
@@ -12,15 +12,30 @@ concurrency:
   group: kyobo-notion
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   run:
-    # 포크에서 돌지 않게(원 저장소만) 하고 싶다면 주석 해제
+    # ← 여기! Environment 이름을 너가 만든 것으로 바꿔줘 (예: production, staging 등)
+    environment: production
+
+    # 필요하면 포크 방지용 오너 체크도 가능
     # if: github.repository_owner == 'YOUR_GH_USERNAME'
+
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
+
     env:
+      # --- REQUIRED SECRETS (Environment에 넣은 값 사용됨) ---
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      DATABASE_ID: ${{ secrets.BOOKS_DB_ID }}
+      # 너의 시크릿명이 DATABASE_ID라면 아래 그대로,
+      # BOOKS_DB_ID로 만들었다면 위 줄은 유지하고 아래 줄을 이렇게 바꿔도 됨:
+      # DATABASE_ID: ${{ secrets.BOOKS_DB_ID }}
+      DATABASE_ID: ${{ secrets.DATABASE_ID }}
+
+      # --- OPTIONAL: Notion property names (네 DB에 맞게 수정 가능) ---
       TITLE_PROP: "책 제목"
       AUTHOR_PROP: "저자"
       PUBLISHER_PROP: "출판사"
@@ -30,24 +45,24 @@ jobs:
       KY_URL_PROP: "교보 URL"
       REQUEST_PROP: "수집요청"
       READ_PAGES_PROP: "읽은 페이지"
-      # 선택: 장르 매핑 쓰면 JSON으로
-      # GENRE_MAP_JSON: '{"소설":"문학","과학":"자연/과학"}'
+      # KY_URL_PROP_TYPE: "rich_text"  # 교보 URL이 리치텍스트일 때만 사용
+      # PAGE_SIZE: "50"
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-      - name: Install Playwright (Chromium)
-        run: |
-          python -m playwright install --with-deps chromium
-
-      - name: Run scraper → Notion updater
-        run: |
-          python kyobo_to_notion.py
+      - name: Install
