@@ -2,7 +2,7 @@ name: Kyobo → Notion (auto fill)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # GitHub 최소 간격: 5분
+    - cron: "*/5 * * * *"  # GitHub Actions' practical minimum interval
   workflow_dispatch: {}
 
 permissions:
@@ -14,13 +14,14 @@ concurrency:
 
 jobs:
   run:
-    # 포크에서 돌지 않게(원 저장소만) 하고 싶다면 주석 해제
+    # Uncomment and set your username to ensure the workflow only runs on your repo (helps if the repo gets forked)
     # if: github.repository_owner == 'YOUR_GH_USERNAME'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       DATABASE_ID: ${{ secrets.BOOKS_DB_ID }}
+      # Optional property names (match your Notion DB)
       TITLE_PROP: "책 제목"
       AUTHOR_PROP: "저자"
       PUBLISHER_PROP: "출판사"
@@ -30,19 +31,39 @@ jobs:
       KY_URL_PROP: "교보 URL"
       REQUEST_PROP: "수집요청"
       READ_PAGES_PROP: "읽은 페이지"
-      # 선택: 장르 매핑 쓰면 JSON으로
       # GENRE_MAP_JSON: '{"소설":"문학","과학":"자연/과학"}'
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Fallback if requirements.txt doesn't include these:
+          python - <<'PY'
+import importlib, sys, subprocess
+pkgs = ['playwright']
+for p in pkgs:
+    try:
+        importlib.import_module(p)
+    except Exception:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', p])
+PY
 
       - name: Install Playwright (Chromium)
         run: |
@@ -50,4 +71,12 @@ jobs:
 
       - name: Run scraper → Notion updater
         run: |
-          python kyobo_to_notion.py
+          # Adjust the entry point if your script has a different filename/path
+          if [ -f kyobo_to_notion.py ]; then
+            python kyobo_to_notion.py
+          elif [ -f scripts/kyobo_to_notion.py ]; then
+            python scripts/kyobo_to_notion.py
+          else
+            echo "::error::Cannot find kyobo_to_notion.py at repo root or scripts/"
+            exit 1
+          fi
