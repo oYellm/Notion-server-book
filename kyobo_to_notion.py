@@ -6,6 +6,52 @@
 # - 읽은 페이지는 절대 수정하지 않음
 
 import os
+
+TITLE_PROP = os.getenv("TITLE_PROP", "책 제목")
+KY_URL_PROP = os.getenv("KY_URL_PROP", "교보 URL")
+KY_URL_PROP_TYPE = os.getenv("KY_URL_PROP_TYPE", "url").lower()  # 'url' or 'rich_text'
+PAGE_SIZE = int(os.getenv("PAGE_SIZE", "50"))
+
+def query_pending_pages_auto(notion, database_id):
+    """Return Notion pages that should be processed automatically:
+    - Title is not empty
+    - Kyobo URL is empty (so we don't re-process completed pages)
+    """
+    # Build 'Kyobo URL is empty' filter depending on property type
+    if KY_URL_PROP_TYPE == "rich_text":
+        url_empty_filter = { "property": KY_URL_PROP, "rich_text": { "is_empty": True } }
+    else:
+        # default: URL property
+        url_empty_filter = { "property": KY_URL_PROP, "url": { "is_empty": True } }
+
+    base_filter = {
+        "and": [
+            { "property": TITLE_PROP, "title": { "is_not_empty": True } },
+            url_empty_filter
+        ]
+    }
+
+    results = []
+    start_cursor = None
+    while True:
+        payload = {
+            "database_id": database_id,
+            "filter": base_filter,
+            "page_size": PAGE_SIZE
+        }
+        if start_cursor:
+            payload["start_cursor"] = start_cursor
+
+        resp = notion.databases.query(**payload)
+        results.extend(resp.get("results", []))
+
+        if not resp.get("has_more"):
+            break
+        start_cursor = resp.get("next_cursor")
+
+    return results
+
+import os
 import re
 import json
 import requests
