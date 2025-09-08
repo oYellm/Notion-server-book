@@ -1,8 +1,8 @@
-name: Kyobo → Notion (auto fill)
+name: Kyobo → Notion (every 5 min)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"  # GitHub Actions' practical minimum interval
+    - cron: "*/5 * * * *"   # GitHub Actions practical minimum interval
   workflow_dispatch: {}
 
 permissions:
@@ -12,16 +12,22 @@ concurrency:
   group: kyobo-notion
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   run:
-    # Uncomment and set your username to ensure the workflow only runs on your repo (helps if the repo gets forked)
+    # 필요하면 포크 방지용으로 Owner 체크 추가:
     # if: github.repository_owner == 'YOUR_GH_USERNAME'
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
+      # --- REQUIRED SECRETS ---
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      DATABASE_ID: ${{ secrets.BOOKS_DB_ID }}
-      # Optional property names (match your Notion DB)
+      DATABASE_ID: ${{ secrets.BOOKS_DB_ID }}  # <- 너의 DB ID 시크릿 이름이 다르면 여기만 수정
+
+      # --- OPTIONAL: Notion property names (네 DB에 맞게 수정 가능) ---
       TITLE_PROP: "책 제목"
       AUTHOR_PROP: "저자"
       PUBLISHER_PROP: "출판사"
@@ -31,7 +37,8 @@ jobs:
       KY_URL_PROP: "교보 URL"
       REQUEST_PROP: "수집요청"
       READ_PAGES_PROP: "읽은 페이지"
-      # GENRE_MAP_JSON: '{"소설":"문학","과학":"자연/과학"}'
+      # KY_URL_PROP_TYPE: "rich_text"  # 교보 URL이 리치텍스트일 때만 사용
+      # PAGE_SIZE: "50"
 
     steps:
       - name: Checkout
@@ -50,21 +57,25 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-   - name: Install dependencies
-  shell: bash
-  run: |
-    python -m pip install --upgrade pip
-    pip install -r requirements.txt
-    python -m playwright install --with-deps chromium
-
-
-      - name: Install Playwright (Chromium)
+      - name: Install dependencies
         run: |
-          python -m playwright install --with-deps chromium
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: (Optional) Install Playwright browser if used
+        run: |
+          # playwright 패키지가 설치되어 있을 때만 브라우저 설치
+          if python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('playwright') else 1)"; then
+            python -m playwright install --with-deps chromium
+          else
+            echo "playwright not detected; skipping browser install"
+          fi
 
       - name: Run scraper → Notion updater
         run: |
-          # Adjust the entry point if your script has a different filename/path
+          # 엔트리포인트 경로에 맞게 자동 탐색
           if [ -f kyobo_to_notion.py ]; then
             python kyobo_to_notion.py
           elif [ -f scripts/kyobo_to_notion.py ]; then
