@@ -2,8 +2,11 @@ name: Kyobo → Notion (auto fill)
 
 on:
   schedule:
-    - cron: "*/1 * * * *"   # 1분마다 (UTC 기준)
-  workflow_dispatch: {}      # 수동 실행 버튼
+    - cron: "*/5 * * * *"   # GitHub 최소 간격: 5분
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
 
 concurrency:
   group: kyobo-notion
@@ -11,40 +14,27 @@ concurrency:
 
 jobs:
   run:
+    # 포크에서 돌지 않게(원 저장소만) 하고 싶다면 주석 해제
+    # if: github.repository_owner == 'YOUR_GH_USERNAME'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      DATABASE_ID:  ${{ secrets.DATABASE_ID }}
-
-      # ── 노션 속성명 (네 DB와 다르면 수정) ──
-      TITLE_PROP:       책 제목
-      AUTHOR_PROP:      저자
-      PUBLISHER_PROP:   출판사
-      PAGES_PROP:       페이지
-      GENRE_PROP:       장르
-      STATUS_PROP:      상태
-      KY_URL_PROP:      교보 URL
-      REQUEST_PROP:     수집요청
-      READ_PAGES_PROP:  읽은 페이지
-
-      # ── 장르 매핑 테이블 ──
-      GENRE_MAP_JSON: >
-        {
-          "과학,자연,물리,화학,생물,천문": "과학",
-          "수학,미적분,통계": "수학",
-          "컴퓨터,IT,프로그래밍,코딩,인공지능,데이터": "IT",
-          "소설,장편,단편,문학": "소설",
-          "에세이,수필": "에세이",
-          "인문,철학,심리": "인문",
-          "역사,세계사,한국사": "역사",
-          "경제,경영,마케팅,회계,재테크": "경영/경제",
-          "자기계발,자기개발,동기": "자기계발"
-        }
+      DATABASE_ID: ${{ secrets.BOOKS_DB_ID }}
+      TITLE_PROP: "책 제목"
+      AUTHOR_PROP: "저자"
+      PUBLISHER_PROP: "출판사"
+      PAGES_PROP: "페이지"
+      GENRE_PROP: "장르"
+      STATUS_PROP: "상태"
+      KY_URL_PROP: "교보 URL"
+      REQUEST_PROP: "수집요청"
+      READ_PAGES_PROP: "읽은 페이지"
+      # 선택: 장르 매핑 쓰면 JSON으로
+      # GENRE_MAP_JSON: '{"소설":"문학","과학":"자연/과학"}'
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
