@@ -1,9 +1,10 @@
+# .github/workflows/kyobo.yml
 name: Kyobo → Notion (every 5 min)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # GitHub Actions practical minimum interval
-  workflow_dispatch: {}
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,30 +13,18 @@ concurrency:
   group: kyobo-notion
   cancel-in-progress: true
 
-defaults:
-  run:
-    shell: bash
-
 jobs:
   run:
-    # ← 여기! Environment 이름을 너가 만든 것으로 바꿔줘 (예: production, staging 등)
-    environment: production
-
-    # 필요하면 포크 방지용 오너 체크도 가능
-    # if: github.repository_owner == 'YOUR_GH_USERNAME'
-
+    environment: production           # 너가 만든 Environment 이름으로 수정해도 됨
     runs-on: ubuntu-latest
     timeout-minutes: 12
 
     env:
-      # --- REQUIRED SECRETS (Environment에 넣은 값 사용됨) ---
+      # --- REQUIRED (레포/환경 시크릿 중 아무데나 있어도 됨) ---
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      # 너의 시크릿명이 DATABASE_ID라면 아래 그대로,
-      # BOOKS_DB_ID로 만들었다면 위 줄은 유지하고 아래 줄을 이렇게 바꿔도 됨:
-      # DATABASE_ID: ${{ secrets.BOOKS_DB_ID }}
-      DATABASE_ID: ${{ secrets.DATABASE_ID }}
+      DATABASE_ID:  ${{ secrets.DATABASE_ID }}
 
-      # --- OPTIONAL: Notion property names (네 DB에 맞게 수정 가능) ---
+      # --- OPTIONAL: Notion property names ---
       TITLE_PROP: "책 제목"
       AUTHOR_PROP: "저자"
       PUBLISHER_PROP: "출판사"
@@ -45,8 +34,6 @@ jobs:
       KY_URL_PROP: "교보 URL"
       REQUEST_PROP: "수집요청"
       READ_PAGES_PROP: "읽은 페이지"
-      # KY_URL_PROP_TYPE: "rich_text"  # 교보 URL이 리치텍스트일 때만 사용
-      # PAGE_SIZE: "50"
 
     steps:
       - name: Checkout
@@ -57,12 +44,33 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
-      - name: Install
+      - name: Install Playwright browser if used
+        run: |
+          if python -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('playwright') else 1)"; then
+            python -m playwright install --with-deps chromium
+          else
+            echo "playwright not detected; skipping browser install"
+          fi
+
+      - name: Debug env (quick check)
+        run: |
+          [ -n "$NOTION_TOKEN" ] || { echo "NOTION_TOKEN is empty"; exit 1; }
+          [ -n "$DATABASE_ID"  ] || { echo "DATABASE_ID is empty";  exit 1; }
+
+      - name: Run scraper → Notion updater
+        run: |
+          if [ -f kyobo_to_notion.py ]; then
+            python kyobo_to_notion.py
+          elif [ -f scripts/kyobo_to_notion.py ]; then
+            python scripts/kyobo_to_notion.py
+          else
+            echo "::error::Cannot find kyobo_to_notion.py at repo root or scripts/"
+            exit 1
+          fi
