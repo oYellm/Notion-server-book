@@ -1,86 +1,63 @@
-name: Kyobo → Notion (every 5 min)
+name: Kyobo → Notion (auto fill)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # GitHub Actions practical minimum interval
-  workflow_dispatch: {}
-
-permissions:
-  contents: read
+    - cron: "*/1 * * * *"   # 1분마다 (UTC 기준)
+  workflow_dispatch: {}      # 수동 실행 버튼
 
 concurrency:
   group: kyobo-notion
   cancel-in-progress: true
 
-defaults:
-  run:
-    shell: bash
-
 jobs:
   run:
-    # 필요하면 포크 방지용으로 Owner 체크 추가:
-    # if: github.repository_owner == 'YOUR_GH_USERNAME'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 10
     env:
-      # --- REQUIRED SECRETS ---
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      DATABASE_ID: ${{ secrets.BOOKS_DB_ID }}  # <- 너의 DB ID 시크릿 이름이 다르면 여기만 수정
+      DATABASE_ID:  ${{ secrets.DATABASE_ID }}
 
-      # --- OPTIONAL: Notion property names (네 DB에 맞게 수정 가능) ---
-      TITLE_PROP: "책 제목"
-      AUTHOR_PROP: "저자"
-      PUBLISHER_PROP: "출판사"
-      PAGES_PROP: "페이지"
-      GENRE_PROP: "장르"
-      STATUS_PROP: "상태"
-      KY_URL_PROP: "교보 URL"
-      REQUEST_PROP: "수집요청"
-      READ_PAGES_PROP: "읽은 페이지"
-      # KY_URL_PROP_TYPE: "rich_text"  # 교보 URL이 리치텍스트일 때만 사용
-      # PAGE_SIZE: "50"
+      # ── 노션 속성명 (네 DB와 다르면 수정) ──
+      TITLE_PROP:       책 제목
+      AUTHOR_PROP:      저자
+      PUBLISHER_PROP:   출판사
+      PAGES_PROP:       페이지
+      GENRE_PROP:       장르
+      STATUS_PROP:      상태
+      KY_URL_PROP:      교보 URL
+      REQUEST_PROP:     수집요청
+      READ_PAGES_PROP:  읽은 페이지
+
+      # ── 장르 매핑 테이블 ──
+      GENRE_MAP_JSON: >
+        {
+          "과학,자연,물리,화학,생물,천문": "과학",
+          "수학,미적분,통계": "수학",
+          "컴퓨터,IT,프로그래밍,코딩,인공지능,데이터": "IT",
+          "소설,장편,단편,문학": "소설",
+          "에세이,수필": "에세이",
+          "인문,철학,심리": "인문",
+          "역사,세계사,한국사": "역사",
+          "경제,경영,마케팅,회계,재테크": "경영/경제",
+          "자기계발,자기개발,동기": "자기계발"
+        }
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
+          pip install -r requirements.txt
 
-      - name: (Optional) Install Playwright browser if used
+      - name: Install Playwright (Chromium)
         run: |
-          # playwright 패키지가 설치되어 있을 때만 브라우저 설치
-          if python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('playwright') else 1)"; then
-            python -m playwright install --with-deps chromium
-          else
-            echo "playwright not detected; skipping browser install"
-          fi
+          python -m playwright install --with-deps chromium
 
       - name: Run scraper → Notion updater
         run: |
-          # 엔트리포인트 경로에 맞게 자동 탐색
-          if [ -f kyobo_to_notion.py ]; then
-            python kyobo_to_notion.py
-          elif [ -f scripts/kyobo_to_notion.py ]; then
-            python scripts/kyobo_to_notion.py
-          else
-            echo "::error::Cannot find kyobo_to_notion.py at repo root or scripts/"
-            exit 1
-          fi
+          python kyobo_to_notion.py
